@@ -6,26 +6,26 @@
 using namespace llvm;
 
 Expression* Expression::getExpression(Instruction &instr) {
-    errs() << "generating an exp:" << "\n";
+    // //dbgs() << "generating an exp:" << "\n";
     //NOTE: for icmp ops, the type of cmp is treated as an argument and should be ok
     unsigned opCode = instr.getOpcode();
     Type *type = instr.getType();
-    std::vector<Value*> args;
-    errs() << instr << "\n";
-    errs() << instr.getOpcodeName() << ": " << instr.getName() << "/" << *type << "\n";
+    std::vector<Value*> *args = new std::vector<Value*>();
+    ////dbgs() << instr << "\n";
+    ////dbgs() << instr.getOpcodeName() << ": " << instr.getName() << "/" << *type << "\n";
     for (auto& operand : instr.operands()) {
-        errs() << *operand << ": " << operand->getName() << "\n";
-        args.push_back(operand);
+        ////dbgs() << *operand << ": " << operand->getName() << "\n";
+        args->push_back(operand);
     }
 
-    return new Expression(opCode, type, args, &instr);
+    return new Expression(opCode, type, *args, &instr);
 }
 
 
 bool Expression::operator<(const Expression &exp) const {
-    errs() << "comparing exps" << "\n";
-    errs() << *this->instr << "\n";
-    errs() << *exp.instr << "\n";
+    /*//dbgs() << "comparing exps" << "\n";
+    //dbgs() << *this->instr << "\n";
+    //dbgs() << *exp.instr << "\n";*/
 
     if (opCode != exp.opCode)
         return opCode < exp.opCode;
@@ -34,7 +34,7 @@ bool Expression::operator<(const Expression &exp) const {
     if (args.size() != exp.args.size())
         return args.size() < exp.args.size();
     for (int i = 0; i < args.size(); ++i) {
-        errs() << args[i] << "\n" << exp.args[i] << "\n";
+        // //dbgs() << args[i] << "\n" << exp.args[i] << "\n";
         if (args[i] != exp.args[i])
             return args[i] < exp.args[i];
     }
@@ -43,8 +43,8 @@ bool Expression::operator<(const Expression &exp) const {
 
 
 bool Expression::relatedTo(Value* var) const {
-    for (Value* arg : args) {
-        if (var == arg)
+    for (Use &U : instr->operands()) {
+        if (var == U.get())
             return true;
     }
     return false;

@@ -14,6 +14,8 @@
 #include <iostream>
 #include <queue>
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Transforms/InstCombine/InstCombineWorklist.h"
 
 using namespace llvm;
 
@@ -44,7 +46,7 @@ namespace {
 
     private:
         //Function &function;
-        std::set<int> expFullSet;
+        //std::set<int> expFullSet;
         BitVector expFullSetVector;
         BitVector expEmptySetVector;
 
@@ -74,38 +76,52 @@ namespace {
         static bool updateToBeUsed(PREInfoNode &cur, std::vector<PREInfoNode*> &backNodes, PRE *pre);
         static std::vector<PREInfoNode*>& getPreds(BasicBlock &cur, PRE *pre);
         static std::vector<PREInfoNode*>& getSuccs(BasicBlock &cur, PRE *pre);
+        void display(BitVector &x) const;
 
-        void transformCFG();
+        void transformCFG(Function &function);
 
+        void init();
     // Function* function;
     };
 }
 
 char PRE::ID = 0;
 
+void PRE::init() {
+    expFullSetVector = BitVector();
+    expEmptySetVector = BitVector();
+    exp2Int.clear();
+    exps.clear();
+    ins2Exp.clear();
+    var2RelatedExpSet.clear();
+    PREInfoNodeMap.clear();
+    exitBBSet.clear();
+}
+
 bool PRE::runOnFunction(Function &function) {
 
-    errs() << "runOnFunction starts" << "\n";
-
+    init();
     preprocess(function); // calc used, kill
+
     workList(function, initAnticipated, updateAnticipated, getSuccs, getPreds);
+
     workList(function, initEarliest, updateEarliest, getPreds, getSuccs);
-    for (auto ele : PREInfoNodeMap) {
+    for (auto &ele : PREInfoNodeMap) {
         ele.second.earliest = ele.second.anticipated[0];
         ele.second.earliest.reset(ele.second.available[0]);
     }
 
     workList(function, initPostponable, updatePostponable, getPreds, getSuccs);
-    for (auto ele : PREInfoNodeMap) {
+    for (auto &ele : PREInfoNodeMap) {
         PREInfoNode &curNode = ele.second;
         curNode.latest = curNode.earliest;
         curNode.latest |= curNode.postponable[0];
 
         std::vector<PREInfoNode*> &succNodes = getSuccs(*ele.first, this);
 
-        BitVector tmp = succNodes.size() > 0 ? expFullSetVector : expEmptySetVector;
-        for (auto node : succNodes) {
-            BitVector tmp2 = node->earliest;
+        BitVector tmp = succNodes.empty() ? expEmptySetVector : expFullSetVector;
+        for (auto &node : succNodes) {
+            BitVector tmp2(node->earliest);
             tmp2 |= node->postponable[0];
             tmp &= tmp2;
         }
@@ -116,9 +132,10 @@ bool PRE::runOnFunction(Function &function) {
     }
 
     workList(function, initToBeUsed, updateToBeUsed, getSuccs, getPreds);
-    transformCFG();
 
-    errs() << "runOnFunction finishes" << "\n";
+    transformCFG(function);
+
+    //dbgs() << "runOnFunction finishes" << "\n";
     return true;
 }
 
@@ -128,10 +145,21 @@ bool PRE::runOnFunction(Function &function) {
 void PRE::preprocess(Function &function) {
 
     // Step 0: split blocks into single-instruction blocks
+    std::vector<BasicBlock*> originalBlockList;
     for (auto& block : function) {
+        originalBlockList.push_back(&block);
+    }
+    for (auto &tmp : originalBlockList) {
+        BasicBlock &block = *tmp;
         if (block.size() > 1) { //TODO: might be a always-true condition
+            bool first = true;
             for (int i = block.size() - 1; i > 0; --i) {
-                SplitBlock(&block, &block.back());
+                if (first) {
+                    SplitBlock(&block, &block.back());
+                    first = false;
+                } else {
+                    SplitBlock(&block, &(*(++block.rbegin())));
+                }
             }
         }
     }
@@ -148,11 +176,13 @@ void PRE::preprocess(Function &function) {
             }
         }
     }
-    for (auto pr : splitPairs) {
+    for (auto& pr : splitPairs) {
         SplitEdge(pr.first, pr.second);
     }
 
-    // Step 2: find all expressions and map them to integers;
+
+    //dbgs() << "preprocess step 2 begins\n";
+    //Step 2: find all expressions and map them to integers;
     for (auto &block : function) {
         for (auto &instr : block) {
             Expression* expPtr = nullptr;
@@ -166,7 +196,7 @@ void PRE::preprocess(Function &function) {
                     InstrUtils::isGoodMiscOp(instr)) {
                 expPtr = Expression::getExpression(instr);
             } else {
-                std::cerr << "found unhandled instr : " << instr.getOpcode() << " during preprocess Step 2" << std::endl;
+                //dbgs() << "found unhandled instr : " << instr.getOpcode() << " during preprocess Step 2\n";
             }
 
             if (expPtr != nullptr) {
@@ -175,18 +205,21 @@ void PRE::preprocess(Function &function) {
         }
     }
 
+    //dbgs() << "preprocess step 3 begins\n" << "fullSetSize:\t" << exp2Int.size() << "\n";
     // Step 2: calc usedBeforeFirstChange, changed, notUsedAfterLastChange, and used for each block
     for (auto& block : function) {
         PREInfoNode &curPREInfoNode = PREInfoNodeMap[&block];
         std::set<int> usedSoFar;
-        curPREInfoNode.notUsedAfterLastChange = BitVector(expFullSet.size(), true); // default: all exps are not used
-        curPREInfoNode.changed = BitVector(expFullSet.size());
-        curPREInfoNode.usedBeforeFirstChange = BitVector(expFullSet.size());
-        curPREInfoNode.used = BitVector(expFullSet.size());
+        curPREInfoNode.notUsedAfterLastChange = BitVector(exp2Int.size(), true); // default: all exps are not used
+        curPREInfoNode.changed = BitVector(exp2Int.size());
+        curPREInfoNode.usedBeforeFirstChange = BitVector(exp2Int.size());
+        curPREInfoNode.used = BitVector(exp2Int.size());
         curPREInfoNode.blockPtr = &block;
 
         for (auto& instr : block) {
-            Value* dest = nullptr;
+            //dbgs() << "prep instr:\n" << instr << "\n";
+
+            Value* dest = &instr;
             Expression *expPtr = nullptr;
             if (instr.isTerminator()) {
                 exitBBSet.insert(&block);
@@ -201,7 +234,6 @@ void PRE::preprocess(Function &function) {
                 ins2Exp[&instr] = expPtr;
             }
             else {
-                std::cerr << "found unhandled instr : " << instr.getOpcode() << " during preprocess Step 3" << std::endl;
             }
 
 
@@ -240,8 +272,9 @@ void PRE::preprocess(Function &function) {
         }
     }
 
-    expFullSetVector = BitVector(expFullSet.size(), true);
-    expEmptySetVector = BitVector(expFullSet.size());
+    expFullSetVector = BitVector(exp2Int.size(), true);
+    expEmptySetVector = BitVector(exp2Int.size());
+    //dbgs() << "preprocess ends\n";
 }
 
 void PRE::workList(Function &function, void (*init)(Function &function, PRE *pre), bool (*update)(PREInfoNode &cur, std::vector<PREInfoNode*> &backNodes, PRE *pre),
@@ -254,7 +287,7 @@ void PRE::workList(Function &function, void (*init)(Function &function, PRE *pre
         q.push(&block);
         ed.insert(&block);
     }
-    while (q.size() > 0) {
+    while (!q.empty()) {
         BasicBlock &cur = *(q.front());
         q.pop();
         ed.erase(&cur);
@@ -273,55 +306,154 @@ void PRE::workList(Function &function, void (*init)(Function &function, PRE *pre
     }
 }
 
-void PRE::transformCFG() {
+void PRE::transformCFG(Function &function) {
     // insert evaluation for each expression at (latest inter tobeused[1])
     // assign new variable names without conflicts
     // update: in LLVM IR maybe it is not necessary to assign a value a name
     // replace each usage of expression with new names
 
+    //DEBUG: output all expressions and blocks
+    //dbgs() << "printing exps\n";
+    for (auto &exp : exps) {
+        //dbgs() << *exp->instr << "\n";
+    }
+    //dbgs() << "printing blocks\n";
+    for (auto &block : function) {
+        //dbgs() << block;
+    }
+
+
+    std::map<BasicBlock*, std::map<int, Value*>> expList;
+
     // collect and insert all new exp evaluations
     std::map<Expression, Value*> expToValueMap;
     for (auto &ele : PREInfoNodeMap) {
         PREInfoNode &curNode = ele.second;
-        BitVector ExpToInsert = curNode.latest;
+        BitVector ExpToInsert(curNode.latest);
         ExpToInsert &= curNode.toBeUsed[1];
         BasicBlock &block = *ele.first;
+        //dbgs() << "INSERTION: visiting block:\n" << block << "\n";
+        display(curNode.changed);
+        display(curNode.anticipated[0]);
+        display(curNode.anticipated[1]);
+        display(curNode.available[0]);
+        display(curNode.available[1]);
+        display(curNode.earliest);
+        display(curNode.postponable[0]);
+        display(curNode.used);
+        display(curNode.latest);
+        display(curNode.toBeUsed[0]);
+        display(curNode.toBeUsed[1]);
+
 
         // insert new evaluations at the beginning
         IRBuilder<> ib(&block);
         for (auto i = 0; i < ExpToInsert.size(); ++i)
             if (ExpToInsert[i]) {
                 Expression &exp = *exps[i];
-                // allocate a value on stack and evaluate the exp
+                //dbgs() << "inserting expression " << exp2Int[exp] << ":\n" << *exp.instr << "\n";
                 ib.SetInsertPoint(&block, block.getFirstInsertionPt());
-                Value* alloPtr = ib.CreateAlloca(exp.type);
-                Value* evaPtr = exp.instr;
-                Value* storePtr = ib.CreateStore(evaPtr, alloPtr);
 
-                /*ib.Insert(alloPtr);
-                ib.Insert(evaPtr);
-                ib.Insert(storePtr);*/
-
-                Value* loadPtr = ib.CreateLoad(alloPtr);
-                expToValueMap[exp] = loadPtr;
+                Value* istValue = ib.Insert(exp.instr->clone());
+                expToValueMap[exp] = istValue;
+                expList[&block][exp2Int[exp]] = istValue;
+                //dbgs() << "block after insertion :\n" << block << "\n";
             }
     }
 
+    std::map<BasicBlock*, std::map<int, std::vector<std::pair<Value*, BasicBlock*>>>> expState;
 
-    for (auto &ele : PREInfoNodeMap) {
+
+    std::queue<BasicBlock*> q;
+    std::map<BasicBlock*, int> ind;
+    for (auto &block : function) {
+        ind[&block] = getPreds(block, this).size();
+    }
+    q.push(&function.getEntryBlock());
+    while (q.size() > 0) {
+
+        BasicBlock &block = *q.front();
+        q.pop();
+        PREInfoNode &curNode = PREInfoNodeMap[&block];
+
+        for (auto &ele : expList[&block]) {
+            expState[&block][ele.first].push_back(std::make_pair(ele.second, &block));
+        }
+
+        std::map<int, Value*> expValueMap;
+        for (int i = 0; i < exp2Int.size(); ++i)
+            if (expState[&block][i].size() > 0) {
+                Value* value;
+                if (expState[&block][i].size() > 1) {
+                    PHINode* phiNode = PHINode::Create(expState[&block][i][0].first->getType(), expState[&block][i].size(), "", block.getFirstNonPHI());
+                    for (int j = 0; j < expState[&block][i].size(); ++j)
+                        phiNode->addIncoming(expState[&block][i][j].first, expState[&block][i][j].second);
+                    value = phiNode;
+                } else
+                    value = expState[&block][i][0].first;
+                expValueMap[i] = value;
+            }
+
+        // replacing old redundant evaluations
+        //IRBuilder<> ib(&block);
+        //dbgs() << "REPLACE: visiting block:\n" << block << "\n";
+        for (auto it = block.begin(); it != block.end(); ) {
+            auto &instr = *it;
+            ++it;
+            if (ins2Exp.find(&instr) == ins2Exp.end()) continue;
+            Expression &exp = *ins2Exp[&instr];
+            int index = exp2Int[exp];
+            //dbgs() << instr << ":" << index << "\n";
+            if (expValueMap.find(index) != expValueMap.end()) {
+                if (expValueMap[index] == &instr) continue;
+                //dbgs() << "replacing old redundant evaluations\n" << block << "\n";
+                //dbgs() << instr << "\n";
+                BasicBlock::iterator nit(&instr);
+                ReplaceInstWithValue(block.getInstList(), nit, expValueMap[index]);
+                //dbgs() << "after replacing old redundant evaluations\n" << block << "\n";
+            }
+        }
+
+        for (auto next : successors(&block)) {
+
+            if ((--ind[next]) == 0) {
+                q.push(next);
+            }
+            for (int i = 0; i < exp2Int.size(); ++i)
+                if (expValueMap.find(i) != expValueMap.end()) {
+                    expState[next][i].push_back(std::make_pair(expValueMap[i], &block));
+                }
+        }
+    }
+
+    /* f or (auto &ele : PREInfoNodeMap) {
         PREInfoNode &curNode = ele.second;
-        BitVector ExpToInsert = curNode.latest;
+        BitVector ExpToInsert(curNode.latest);
         ExpToInsert &= curNode.toBeUsed[1];
         BasicBlock &block = *ele.first;
 
-        // insert new evaluations at the beginning
-        IRBuilder<> ib(&block);
-        for (auto &instr : block)
-            if (ins2Exp.find(&instr) != ins2Exp.end()) {
-                Expression &exp = *ins2Exp[&instr];
-                BasicBlock::iterator it(&instr);
-                ReplaceInstWithValue(block.getInstList(), it, expToValueMap[exp]);
+        // replacing old redundant evaluations
+        //IRBuilder<> ib(&block);
+        for (auto it = block.begin(); it != block.end(); ) {
+            auto &instr = *it;
+            ++it;
+            if (ins2Exp.find(&instr) == ins2Exp.end()) continue;
+            Expression &exp = *ins2Exp[&instr];
+            if (expToValueMap.find(exp) != expToValueMap.end()) {
+                if (expToValueMap[exp] == &instr) continue;
+                //dbgs() << "replacing old redundant evaluations\n" << block << "\n";
+                //dbgs() << instr << "\n";
+                BasicBlock::iterator nit(&instr);
+                ReplaceInstWithValue(block.getInstList(), nit, expToValueMap[exp]);
+                //dbgs() << "after replacing old redundant evaluations\n" << block << "\n";
             }
+        }
+    }*/
+
+
+    //dbgs() << "printing final blocks\n";
+    for (auto &block : function) {
+        //dbgs() << block;
     }
 }
 
@@ -339,7 +471,7 @@ void PRE::initAnticipated(Function &function, PRE *pre) {
 }
 bool PRE::updateAnticipated(PREInfoNode &curNode, std::vector<PREInfoNode*> &backNodes, PRE *pre) {
     BitVector* cur = curNode.anticipated;
-    BitVector originalIn = cur[0];
+    BitVector originalIn(cur[0]);
 
     // calc out
     cur[1] = backNodes.size() > 0 ? pre->expFullSetVector : pre->expEmptySetVector;
@@ -348,6 +480,7 @@ bool PRE::updateAnticipated(PREInfoNode &curNode, std::vector<PREInfoNode*> &bac
     }
 
     // calc in: in = (out - kill) u usedinblock
+    // calc in: in = (out U usedinblock)
     cur[0] = cur[1];
     cur[0].reset(curNode.changed);
     cur[0] |= curNode.usedBeforeFirstChange;
@@ -369,15 +502,16 @@ void PRE::initEarliest(Function &function, PRE *pre) {
 }
 bool PRE::updateEarliest(PREInfoNode &curNode, std::vector<PREInfoNode*> &backNodes, PRE *pre) {
     BitVector* cur = curNode.available;
-    BitVector originalOut = cur[1];
+    BitVector originalOut(cur[1]);
 
     // calc out
-    cur[0] = backNodes.size() > 0 ? pre->expFullSetVector : pre->expEmptySetVector;
+    cur[0] = backNodes.empty() ? pre->expEmptySetVector : pre->expFullSetVector;
     for (auto &from : backNodes) {
         cur[0] &= from->available[1];
     }
 
     // calc out: out = (in U in_ant) - kill
+    // calc out: out = (in U in_ant)
     cur[1] = cur[0];
     cur[1] |= curNode.anticipated[0];
     cur[1].reset(curNode.changed);
@@ -399,7 +533,7 @@ void PRE::initPostponable(Function &function, PRE *pre) {
 }
 bool PRE::updatePostponable(PREInfoNode &curNode, std::vector<PREInfoNode*> &backNodes, PRE *pre) {
     BitVector* cur = curNode.postponable;
-    BitVector originalOut = cur[1];
+    BitVector originalOut(cur[1]);
 
     // calc out
     cur[0] = backNodes.size() > 0 ? pre->expFullSetVector : pre->expEmptySetVector;
@@ -417,13 +551,13 @@ bool PRE::updatePostponable(PREInfoNode &curNode, std::vector<PREInfoNode*> &bac
 
 void PRE::initToBeUsed(Function &function, PRE *pre) {
     for (auto &ele : pre->PREInfoNodeMap) {
-        ele.second.toBeUsed[0] = pre->expFullSetVector;
-        ele.second.toBeUsed[1] = pre->expFullSetVector;
+        ele.second.toBeUsed[0] = pre->expEmptySetVector;
+        ele.second.toBeUsed[1] = pre->expEmptySetVector;
     }
 }
 bool PRE::updateToBeUsed(PREInfoNode &curNode, std::vector<PREInfoNode*> &backNodes, PRE *pre) {
     BitVector* cur = curNode.toBeUsed;
-    BitVector originalIn = cur[0];
+    BitVector originalIn(cur[0]);
 
     // calc out
     cur[1] = pre->expEmptySetVector;
@@ -431,7 +565,7 @@ bool PRE::updateToBeUsed(PREInfoNode &curNode, std::vector<PREInfoNode*> &backNo
         cur[1] |= from->toBeUsed[0];
     }
 
-    // calc in: in = (out - kill) u usedinblock
+    // calc in: in = (out U used) - latest
     cur[0] = cur[1];
     cur[0] |= curNode.used;
     cur[0].reset(curNode.latest);
@@ -457,6 +591,7 @@ std::vector<PRE::PREInfoNode*>& PRE::getSuccs(BasicBlock &cur, PRE *pre) {
 
 void PRE::updateExpSet(Expression *expPtr) {
     if (exp2Int.find(*expPtr) == exp2Int.end()) {
+        //dbgs() << "add new exp to map:\n" << *expPtr->instr << "\n";
         exps.push_back(expPtr);
         int newIdx = exp2Int.size();
         exp2Int[*expPtr] = newIdx;
@@ -465,14 +600,16 @@ void PRE::updateExpSet(Expression *expPtr) {
 
 int PRE::getExpIndex(Expression *expPtr) {
     // assuming the expression should exist
+    int rtn = -1;
     if (exp2Int.find(*expPtr) != exp2Int.end())
-        return exp2Int[*expPtr];
-    return -1;
+        rtn = exp2Int[*expPtr];
+    //dbgs() << "getExpIndex:\n" << *expPtr->instr << "\t" << rtn << "\n";
+    return rtn;
 }
 
 BitVector* PRE::getVarRelatedExpSet(Value* dest) {
     if (var2RelatedExpSet.find(dest) == var2RelatedExpSet.end()) {
-        BitVector rtn = BitVector();
+        BitVector rtn = BitVector(exps.size(), false);
         for (unsigned long i = 0; i < exps.size(); ++i) {
             if (exps[i]->relatedTo(dest)) {
                 rtn.set(i);
@@ -480,11 +617,22 @@ BitVector* PRE::getVarRelatedExpSet(Value* dest) {
         }
         var2RelatedExpSet[dest] = rtn;
     }
+    //dbgs() << "related set: " << dest << " -> ";
+    display(var2RelatedExpSet[dest]);
     return &var2RelatedExpSet[dest];
 }
 
+void PRE::display(BitVector &x) const {
+    //dbgs() << "{";
+    for (auto i = 0; i < x.size(); ++i)
+        if (x[i]) {
+            //dbgs() << i << ",";
+        }
+    //dbgs() << "}\n";
+}
 
 
+static RegisterPass<PRE> X("PRE", "Partial Redundancy Elimination Pass", true, true);
 // Automatically enable the pass.
 // http://adriansampson.net/blog/clangpass.html
 static void registerPRE(const PassManagerBuilder &,
